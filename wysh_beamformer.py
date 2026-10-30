@@ -15,15 +15,19 @@ Needs only numpy + pyserial. Audio goes out through `aplay` (no PyAudio).
 
 Controls while running:
     <number>   steer the beam, degrees  (0 = straight ahead, +90 = right, -90 = left, +-180 = behind)
+    s          sweep -90..+90 deg, print output level per angle, beam goes to the loudest
     m          toggle MVDR <-> delay-and-sum
     g <x>      output gain, e.g.  g 5
     q          quit
 """
+import os
 import sys
 import time
+import math
+import queue
 import threading
 import subprocess
-from collections import deque
+import multiprocessing as mp
 
 import numpy as np
 import serial
@@ -34,6 +38,7 @@ SERIAL_BAUD = 3000000
 
 SAMPLE_RATE = 27e6 / 26 / 64      # ~16226 Hz, fixed by the FPGA clock divider
 ALSA_DEVICE = 'plughw:Headphones' # Pi 3.5 mm jack (see `aplay -l`)
+ALSA_BUFFER_US = 400000           # aplay -B, in microseconds (400 ms). Raise if underruns appear.
 
 # --- which FPGA channels to use and where those mics physically sit -------------
 # 6-mic ring: ch0..ch5 = mics 0..5.  Coordinates in metres: x = right, y = straight ahead.
@@ -43,7 +48,7 @@ ALSA_DEVICE = 'plughw:Headphones' # Pi 3.5 mm jack (see `aplay -l`)
 #    RING_RADIUS_M    - measure centre-of-board to a ring mic (or half the distance between opposite mics)
 #    RING_ANGLES_DEG  - angle of each channel around the ring, 0 = top of the board, clockwise.
 #                       Default assumes ch0..ch5 run around the ring in order, 60 deg apart.
-#                       Tap each mic while running wysh_rx.py and edit this list to match.
+#                       Use the `s` sweep to check this against a sound source.
 RING_RADIUS_M = 0.046
 RING_ANGLES_DEG = [0, 60, 120, 180, 240, 300]
 
@@ -65,13 +70,15 @@ FREQ_MAX = 4000.0
 HIGH_PASS_HZ = 100.0   # bins below this are zeroed (removes DC and rumble)
 ALPHA = 0.98           # covariance smoothing per frame (~127 frames/s -> ~0.4 s memory)
 LOADING = 0.05         # diagonal loading, relative to signal power (higher = safer, closer to DAS)
-OUTPUT_GAIN = 3.0
-MAX_BUFFER_S = 0.3     # if the Pi falls behind by more than this, old audio is dropped
+WEIGHT_EVERY = 4       # MVDR weights are recomputed every N hops (covariance still updates every hop)
+OUTPUT_GAIN = 7.0
+QUEUE_CHUNKS = 200     # max serial chunks waiting for the DSP (~3 s of audio)
 
 SPEED_OF_SOUND = 343.0
 
 # --- stream constants (must match the FPGA) ------------------------------------
 SYNC = 0xA5
+SYNC_BYTE = b'\xa5'
 N_STREAM_CH = 8
 FRAME = 1 + 2 * N_STREAM_CH   # 17 bytes
 
@@ -80,23 +87,32 @@ running = True
 azimuth = 0.0
 mode = 'mvdr'
 gain = OUTPUT_GAIN
-stats = {'frames': 0, 'dropped': 0, 'resync': 0}
+stats = {'underrun': 0}
+dsp_t = {'busy': 0.0, 'calls': 0, 'max': 0.0}          # time spent inside bf.process()
+level = {'sum_sq': 0.0, 'n': 0, 'last_rms': 0.0}       # output level (before gain)
+lock = threading.Lock()
+
+# Shared counters between the reader process and the main process.
+# Index: 0 = resync bytes discarded, 1 = frames received, 2 = frames dropped (DSP too slow)
+CNT_RESYNC, CNT_FRAMES, CNT_DROPPED = 0, 1, 2
 
 
 # ============================ FRAME PARSER ============================
-def extract_frames(buf):
+def extract_frames(buf, cnt):
     """Pull complete, aligned frames out of bytearray `buf` (consumed in place).
+    Locks only when 4 consecutive frames start with the sync byte.
     Returns int16 array (n, 8) or None."""
-    while len(buf) >= 4 * FRAME and not (buf[0] == SYNC and buf[FRAME] == SYNC and
-                                         buf[2 * FRAME] == SYNC and buf[3 * FRAME] == SYNC):
-        stats['resync'] += 1
-        nxt = buf.find(b'\xa5', 1)
-        if nxt < 0:
-            buf.clear()
-        else:
-            del buf[:nxt]
-    if len(buf) < 4 * FRAME:
+    need = 4 * FRAME
+    slipped = 0
+    while len(buf) >= need and not all(buf[i * FRAME] == SYNC for i in range(4)):
+        del buf[0]
+        slipped += 1
+    if slipped:
+        cnt[CNT_RESYNC] += slipped
+
+    if len(buf) < need:
         return None
+
     n = len(buf) // FRAME
     raw = np.frombuffer(bytes(buf[:n * FRAME]), np.uint8).reshape(n, FRAME)
     bad = np.flatnonzero(raw[:, 0] != SYNC)
@@ -110,34 +126,46 @@ def extract_frames(buf):
     return pcm
 
 
-# ============================ FRAME QUEUE =============================
-class FrameQueue:
-    """Thread-safe queue of sample blocks; drops the oldest audio if the consumer lags."""
-    def __init__(self, max_frames):
-        self.q = deque()
-        self.n = 0
-        self.max = max_frames
-        self.cv = threading.Condition()
+# ============================= READER PROCESS =========================
+def reader_proc(port, baud, out_q, cnt):
+    """Runs in its own process so the DSP work can't take the GIL away from it.
+    Does only: read bytes, parse frames, select channels, push to the queue."""
+    try:
+        os.sched_setaffinity(0, {3})   # keep the reader on core 3, away from the DSP
+    except Exception:
+        pass
+    try:
+        os.nice(-10)                   # higher priority; needs root
+    except OSError:
+        pass
 
-    def put(self, arr):
-        with self.cv:
-            self.q.append(arr)
-            self.n += len(arr)
-            while self.n > self.max and len(self.q) > 1:
-                old = self.q.popleft()
-                self.n -= len(old)
-                stats['dropped'] += len(old)
-            self.cv.notify()
+    try:
+        ser = serial.Serial(port, baud, timeout=0.1)
+        ser.reset_input_buffer()
+    except Exception as e:
+        print(f"Cannot open {port}: {e}", flush=True)
+        return
 
-    def get(self, timeout=0.2):
-        with self.cv:
-            if not self.q:
-                self.cv.wait(timeout)
-            if not self.q:
-                return None
-            arr = self.q.popleft()
-            self.n -= len(arr)
-            return arr
+    buf = bytearray()
+    while True:
+        try:
+            data = ser.read(4096)          # returns after 4096 bytes or 0.1 s
+        except Exception as e:
+            print(f"\nserial error: {e}", flush=True)
+            time.sleep(0.5)
+            continue
+        if not data:
+            continue
+        buf += data
+        pcm = extract_frames(buf, cnt)
+        if pcm is None:
+            continue
+        sel = pcm[:, MIC_CHANNELS].astype(np.float64) / 32768.0
+        cnt[CNT_FRAMES] += len(sel)
+        try:
+            out_q.put_nowait(sel)
+        except queue.Full:
+            cnt[CNT_DROPPED] += len(sel)
 
 
 # ============================= BEAMFORMER =============================
@@ -154,6 +182,9 @@ class Beamformer:
         self.ola = np.zeros(NFFT)
         self._az = None
         self._a = None
+        self._w = None
+        self._wkey = None
+        self._hops = 0
 
     def steering(self, az_deg):
         """a[f, m]: phase of a plane wave from azimuth az at mic m (mics nearer the source hear it earlier)."""
@@ -171,17 +202,25 @@ class Beamformer:
         self.R = ALPHA * self.R + (1 - ALPHA) * (X[:, :, None] * X[:, None, :].conj())
 
         a = self.steering(az_deg)
-        w = a / self.M                                                      # delay-and-sum weights
         if mode == 'mvdr' and self.M > 1 and len(self.band):
-            idx = self.band
-            Rb = self.R[idx]
-            tr = np.trace(Rb, axis1=1, axis2=2).real / self.M
-            Rb = Rb + (LOADING * tr + 1e-10)[:, None, None] * np.eye(self.M)
-            ab = a[idx]
-            Ria = np.linalg.solve(Rb, ab[..., None])[..., 0]                # R^-1 a
-            den = np.einsum('fm,fm->f', ab.conj(), Ria).real
-            w = w.copy()
-            w[idx] = Ria / den[:, None]                                     # distortionless in look direction
+            key = (az_deg, mode)
+            self._hops += 1
+            if self._w is None or self._wkey != key or self._hops % WEIGHT_EVERY == 0:
+                w = a / self.M
+                idx = self.band
+                Rb = self.R[idx]
+                tr = np.trace(Rb, axis1=1, axis2=2).real / self.M
+                Rb = Rb + (LOADING * tr + 1e-10)[:, None, None] * np.eye(self.M)
+                ab = a[idx]
+                Ria = np.linalg.solve(Rb, ab[..., None])[..., 0]            # R^-1 a
+                den = np.einsum('fm,fm->f', ab.conj(), Ria).real
+                w = w.copy()
+                w[idx] = Ria / den[:, None]                                 # distortionless in look direction
+                self._w = w
+                self._wkey = key
+            w = self._w
+        else:
+            w = a / self.M                                                  # delay-and-sum weights
 
         Y = np.einsum('fm,fm->f', w.conj(), X)
         Y[self.hp] = 0.0
@@ -193,41 +232,34 @@ class Beamformer:
 
 
 # ================================ THREADS =============================
-def reader_loop(ser, fq):
-    buf = bytearray()
-    while running:
-        try:
-            data = ser.read(max(1, ser.in_waiting))
-        except Exception as e:
-            print(f"\nserial error: {e}")
-            time.sleep(0.5)
-            continue
-        if not data:
-            continue
-        buf += data
-        pcm = extract_frames(buf)
-        if pcm is None:
-            continue
-        sel = pcm[:, MIC_CHANNELS].astype(np.float64) / 32768.0
-        stats['frames'] += len(sel)
-        fq.put(sel)
-
-
-def dsp_loop(fq, player):
+def dsp_loop(q, player):
     global running
     bf = Beamformer(MIC_POSITIONS)
     in_buf = np.zeros((0, bf.M))
     while running:
-        arr = fq.get()
-        if arr is None:
+        try:
+            arr = q.get(timeout=0.2)
+        except queue.Empty:
             continue
         in_buf = np.concatenate([in_buf, arr])
         outs = []
         while len(in_buf) >= NFFT:
+            t0 = time.perf_counter()
             outs.append(bf.process(in_buf[:NFFT], AZIMUTH_SIGN * azimuth, mode))
+            dt = time.perf_counter() - t0
+            with lock:
+                dsp_t['busy'] += dt
+                dsp_t['calls'] += 1
+                if dt > dsp_t['max']:
+                    dsp_t['max'] = dt
             in_buf = in_buf[HOP:]
         if outs:
-            y = np.clip(np.concatenate(outs) * gain, -1.0, 1.0)
+            raw = np.concatenate(outs)
+            with lock:
+                level['sum_sq'] += float(np.dot(raw, raw))
+                level['n'] += len(raw)
+                level['last_rms'] = math.sqrt(float(np.mean(raw * raw)))
+            y = np.clip(raw * gain, -1.0, 1.0)
             try:
                 player.stdin.write((y * 32767).astype('<i2').tobytes())
                 player.stdin.flush()
@@ -236,15 +268,60 @@ def dsp_loop(fq, player):
                 running = False
 
 
-def stats_loop():
-    last_t, last_n = time.time(), 0
+def aplay_stderr_loop(proc):
+    """Count ALSA underruns. A non-zero count means the DSP is not keeping up with playback."""
+    for line in proc.stderr:
+        n = line.count(b'underrun')
+        if n:
+            with lock:
+                stats['underrun'] += n
+
+
+def stats_loop(cnt):
+    last_t, last_n, last_busy = time.time(), 0, 0.0
+    budget_ms = HOP / SAMPLE_RATE * 1000
     while running:
         time.sleep(5.0)
         now = time.time()
-        n = stats['frames']
-        print(f"[stats] {(n - last_n) / (now - last_t):7.0f} frames/s | dropped {stats['dropped']} | "
-              f"resync {stats['resync']} | az {azimuth:+.0f} | {mode} | gain {gain:g}")
-        last_t, last_n = now, n
+        n = cnt[CNT_FRAMES]
+        with lock:
+            busy = dsp_t['busy']
+            mx = dsp_t['max']
+            dsp_t['max'] = 0.0
+            rms = level['last_rms']
+            under = stats['underrun']
+        wall = now - last_t
+        load = (busy - last_busy) / wall * 100
+        print(f"[stats] {(n - last_n) / wall:7.0f} frames/s | dsp {load:4.1f}% | "
+              f"max call {mx * 1000:4.1f} ms (budget {budget_ms:.1f}) | "
+              f"dropped {cnt[CNT_DROPPED]} | resync {cnt[CNT_RESYNC]} | underrun {under} | "
+              f"rms {rms:.4f} | az {azimuth:+.0f} | {mode} | gain {gain:g}")
+        last_t, last_n, last_busy = now, n, busy
+
+
+def sweep(step=15, hold=2.0):
+    """Sweep the beam across -90..+90 and report output level per angle.
+    Leaves the beam pointed at the loudest angle."""
+    global azimuth
+    print(f"sweeping -90..+90 in {step} deg steps, {hold:g} s each. Keep the source still.")
+    results = []
+    for ang in range(-90, 91, step):
+        azimuth = float(ang)
+        time.sleep(0.5)                        # let the covariance settle
+        with lock:
+            level['sum_sq'] = 0.0
+            level['n'] = 0
+        time.sleep(hold)
+        with lock:
+            s, n = level['sum_sq'], level['n']
+        rms = math.sqrt(s / n) if n else 0.0
+        db = 20 * math.log10(rms) if rms > 0 else -120.0
+        results.append((ang, rms))
+        print(f"  {ang:+4d} deg   rms {rms:.5f}   {db:6.1f} dBFS")
+    peak_ang, _ = max(results, key=lambda r: r[1])
+    azimuth = float(peak_ang)
+    print(f"peak at {peak_ang:+d} deg, beam set there.")
+    print("If that is not where the source is, flip AZIMUTH_SIGN.")
 
 
 # ================================ MAIN ================================
@@ -260,24 +337,30 @@ def main():
     print(f"  channels : {MIC_CHANNELS}  ({len(MIC_CHANNELS)} mics)")
     if d:
         print(f"  spacing  : {min(d) * 1000:.1f} mm min  -> spatial aliasing above ~{SPEED_OF_SOUND / (2 * min(d)):.0f} Hz")
-    print(f"  audio out: {ALSA_DEVICE}")
+    print(f"  audio out: {ALSA_DEVICE}  (buffer {ALSA_BUFFER_US / 1000:.0f} ms)")
     print("=" * 66)
 
-    try:
-        ser = serial.Serial(port, SERIAL_BAUD, timeout=0.1)
-        ser.reset_input_buffer()
-    except Exception as e:
-        print(f"Cannot open {port}: {e}")
+    q = mp.Queue(maxsize=QUEUE_CHUNKS)
+    cnt = mp.Array('q', 3)
+    reader = mp.Process(target=reader_proc, args=(port, SERIAL_BAUD, q, cnt), daemon=True)
+    reader.start()
+    time.sleep(0.5)
+    if not reader.is_alive():
+        print("Reader could not open the serial port. Check the message above.")
         print("Check: ls -l /dev/serial0  |  python3 -m serial.tools.list_ports -v")
         sys.exit(1)
 
     player = subprocess.Popen(
-        ['aplay', '-q', '-D', ALSA_DEVICE, '-t', 'raw', '-f', 'S16_LE',
-         '-r', str(int(round(SAMPLE_RATE))), '-c', '1', '-B', '200000'],
-        stdin=subprocess.PIPE)
+        ['aplay', '-D', ALSA_DEVICE, '-t', 'raw', '-f', 'S16_LE',
+         '-r', str(int(round(SAMPLE_RATE))), '-c', '1', '-B', str(ALSA_BUFFER_US)],
+        stdin=subprocess.PIPE, stderr=subprocess.PIPE)
 
-    fq = FrameQueue(int(MAX_BUFFER_S * SAMPLE_RATE))
-    for fn, args in ((reader_loop, (ser, fq)), (dsp_loop, (fq, player)), (stats_loop, ())):
+    threads = [
+        (dsp_loop, (q, player)),
+        (stats_loop, (cnt,)),
+        (aplay_stderr_loop, (player,)),
+    ]
+    for fn, args in threads:
         threading.Thread(target=fn, args=args, daemon=True).start()
 
     print(__doc__.split("Controls while running:")[1])
@@ -290,7 +373,9 @@ def main():
             continue
         if cmd == 'q':
             break
-        if cmd == 'm':
+        if cmd in ('s', 'sweep'):
+            sweep()
+        elif cmd == 'm':
             mode = 'das' if mode == 'mvdr' else 'mvdr'
             print(f"mode: {mode}")
         elif cmd.startswith('g'):
@@ -317,7 +402,7 @@ def main():
     except Exception:
         pass
     player.terminate()
-    ser.close()
+    reader.terminate()
     print("done")
 
 
